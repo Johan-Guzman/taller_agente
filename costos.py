@@ -1,98 +1,210 @@
-import sys, statistics
+
+import os
+import sys
+import statistics
 from pathlib import Path
+
 from dotenv import load_dotenv
-load_dotenv()
 from langsmith import Client
 
+load_dotenv(override=True)
+
+PROJECT_PREFIX = os.getenv("LANGSMITH_PROJECT", "agente-secop")
 client = Client()
 
 
-def resumen(prefijo: str) -> dict:
-    proyectos = list(client.list_projects(name_contains=prefijo, include_stats=True))
-    if not proyectos:
-        raise SystemExit(f"No hay experimentos con prefijo '{prefijo}'")
-    p = max(proyectos, key=lambda x: x.start_time)
+def obtener_runs(project_name: str) -> list:
+    """Obtiene las ejecuciones del proyecto, incluyendo las anidadas."""
     try:
-        runs = list(client.list_runs(project_name=p.name, is_root=True))
-    except Exception:
-        runs = []
-    n = len(runs) or 1
-    costo = sum(float(getattr(r, 'total_cost', 0) or 0) for r in runs)
-    t_in = sum(getattr(r, 'prompt_tokens', 0) or 0 for r in runs)
-    t_out = sum(getattr(r, 'completion_tokens', 0) or 0 for r in runs)
-    lat = sorted((r.end_time - r.start_time).total_seconds() for r in runs if getattr(r, 'end_time', None) and getattr(r, 'start_time', None))
-    p95 = lat[int(0.95 * (len(lat) - 1))] if lat else 0
-    fb = getattr(p, 'feedback_stats', None) or {}
+        return list(client.list_runs(project_name=project_name))
+    except Exception as exc:
+        raise SystemExit(
+            f"Error consultando las ejecuciones de '{project_name}': {exc}"
+        ) from exc
+
+
+def es_raiz(run) -> bool:
+    """Identifica ejecuciones raíz para contar preguntas."""
+    return getattr(run, "parent_run_id", None) is None
+
+
+def es_llamada_modelo(run) -> bool:
+    """Identifica ejecuciones de modelos de lenguaje."""
+    return getattr(run, "run_type", None) in ("llm", "chat_model")
+
+
+def numero(valor) -> float:
+    """Convierte valores numéricos ausentes en cero."""
+    try:
+        return float(valor or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def resumen(prefijo: str) -> dict:
+    proyectos = list(
+        client.list_projects(
+            name_contains=prefijo,
+            include_stats=True,
+        )
+    )
+
+    if not proyectos:
+        raise SystemExit(
+            f"No hay proyectos de LangSmith con el prefijo '{prefijo}'."
+        )
+
+    proyecto = max(
+        proyectos,
+        key=lambda p: p.start_time or p.id,
+    )
+
+    runs = obtener_runs(proyecto.name)
+    raices = [r for r in runs if es_raiz(r)]
+    modelos = [r for r in runs if es_llamada_modelo(r)]
+
+    # Algunos modelos o integraciones no reportan tokens/costos.
+    tokens_in = sum(
+        int(numero(getattr(r, "prompt_tokens", 0)))
+        for r in modelos
+    )
+    tokens_out = sum(
+        int(numero(getattr(r, "completion_tokens", 0)))
+        for r in modelos
+    )
+    costo = sum(
+        numero(getattr(r, "total_cost", 0))
+        for r in modelos
+    )
+
+    # Latencia de las preguntas completas, no de cada herramienta.
+    latencias = sorted(
+        (r.end_time - r.start_time).total_seconds()
+        for r in raices
+        if getattr(r, "end_time", None)
+        and getattr(r, "start_time", None)
+    )
+
+    p95 = (
+        latencias[min(int(0.95 * (len(latencias) - 1)), len(latencias) - 1)]
+        if latencias
+        else 0
+    )
+
+    # Recupera estadísticas de feedback si existen.
+    feedback = getattr(proyecto, "feedback_stats", None) or {}
     precision = {}
-    for k, v in fb.items():
-        if isinstance(v, dict):
-            avg = v.get("avg")
-            if avg is None:
-                avg = v.get("mean")
-            if avg is not None:
-                try:
-                    precision[k] = round(float(avg) * 100, 1)
-                    continue
-                except Exception:
-                    pass
-            # Si no hay avg pero hay valores
-            vals = v.get("values") or {}
-            if vals:
-                try:
-                    # intentar promedio de valores numéricos
-                    total = 0
-                    count = 0
-                    for kk, vv in vals.items():
-                        if isinstance(vv, dict):
-                            total += float(vv.get("count", 0)) * float(vv.get("avg", vv.get("value", 0)))
-                            count += int(vv.get("count", 0))
-                    if count > 0:
-                        precision[k] = round((total / count) * 100, 1)
-                        continue
-                except Exception:
-                    pass
-        try:
-            if v is not None and not isinstance(v, dict):
-                precision[k] = round(float(v) * 100, 1)
-        except Exception:
-            pass
+
+    for clave, valor in feedback.items():
+        if isinstance(valor, dict):
+            promedio = valor.get("avg", valor.get("mean"))
+            if promedio is not None:
+                precision[clave] = round(numero(promedio) * 100, 1)
+        elif valor is not None:
+            try:
+                precision[clave] = round(float(valor) * 100, 1)
+            except (TypeError, ValueError):
+                pass
+
+    preguntas = len(raices)
+
+    if not modelos:
+        print(
+            f"AVISO: el proyecto '{proyecto.name}' no contiene "
+            "ejecuciones identificadas como llamadas a modelos."
+        )
+
+    if modelos and tokens_in == 0 and tokens_out == 0:
+        print(
+            f"AVISO: '{proyecto.name}' tiene ejecuciones de modelo, "
+            "pero no reporta tokens. Revisa los metadatos de uso."
+        )
+
     return {
-        "experimento": p.name,
-        "preguntas": n,
+        "experimento": proyecto.name,
+        "preguntas": preguntas,
         "precision": precision,
-        "tokens_in": t_in,
-        "tokens_out": t_out,
-        "tokens_total": t_in + t_out,
+        "tokens_in": tokens_in,
+        "tokens_out": tokens_out,
+        "tokens_total": tokens_in + tokens_out,
         "costo_total": costo,
-        "costo_pregunta": costo / n,
-        "lat_p50": statistics.median(lat) if lat else 0,
+        "costo_pregunta": costo / preguntas if preguntas else 0,
+        "lat_p50": statistics.median(latencias) if latencias else 0,
         "lat_p95": p95,
+        "total_runs": len(runs),
+        "runs_modelo": len(modelos),
     }
 
 
 def tabla(filas: list[dict]) -> str:
-    claves = sorted({k for f in filas for k in f.get("precision", {})})
-    cab = ["Experimento", "Preg."] + [f"Prec. {k} %" for k in claves] + \
-          ["Tokens in", "Tokens out", "Tokens total", "Costo USD", "USD/preg.", "Lat. p50 s", "Lat. p95 s"]
-    out = ["| " + " | ".join(cab) + " |", "|" + "---|" * len(cab)]
-    for f in filas:
-        prec = f.get("precision", {})
-        out.append("| " + " | ".join(
-            [f.get("experimento", ""), str(f.get("preguntas", ""))]
-            + [str(prec.get(k, "-")) for k in claves]
-            + [f"{f.get('tokens_in', 0):,}", f"{f.get('tokens_out', 0):,}",
-               f"{f.get('tokens_total', 0):,}",
-               f"{f.get('costo_total', 0):.6f}", f"{f.get('costo_pregunta', 0):.6f}",
-               f"{f.get('lat_p50', 0):.2f}", f"{f.get('lat_p95', 0):.2f}"]) + " |")
-    return "\n".join(out)
+    claves = sorted({
+        clave
+        for fila in filas
+        for clave in fila.get("precision", {})
+    })
+
+    cabecera = (
+        ["Experimento", "Preg.", "Ejecuciones", "Llamadas modelo"]
+        + [f"Prec. {clave} %" for clave in claves]
+        + [
+            "Tokens in",
+            "Tokens out",
+            "Tokens total",
+            "Costo USD",
+            "USD/preg.",
+            "Lat. p50 s",
+            "Lat. p95 s",
+        ]
+    )
+
+    salida = [
+        "| " + " | ".join(cabecera) + " |",
+        "|" + "---|" * len(cabecera),
+    ]
+
+    for fila in filas:
+        precision = fila.get("precision", {})
+
+        celdas = (
+            [
+                fila["experimento"],
+                str(fila["preguntas"]),
+                str(fila["total_runs"]),
+                str(fila["runs_modelo"]),
+            ]
+            + [str(precision.get(clave, "-")) for clave in claves]
+            + [
+                f'{fila["tokens_in"]:,}',
+                f'{fila["tokens_out"]:,}',
+                f'{fila["tokens_total"]:,}',
+                f'{fila["costo_total"]:.6f}',
+                f'{fila["costo_pregunta"]:.6f}',
+                f'{fila["lat_p50"]:.2f}',
+                f'{fila["lat_p95"]:.2f}',
+            ]
+        )
+
+        salida.append("| " + " | ".join(celdas) + " |")
+
+    return "\n".join(salida)
 
 
 if __name__ == "__main__":
     if len(sys.argv) < 2:
-        raise SystemExit("Uso: python costos.py <prefijo1> [<prefijo2> ...]")
-    filas = [resumen(a) for a in sys.argv[1:]]
-    md = tabla(filas)
-    print(md)
+        raise SystemExit(
+            "Uso: python costos.py <prefijo1> [<prefijo2> ...]\n"
+            f"Proyecto configurado por defecto: {PROJECT_PREFIX}"
+        )
+
+    filas = [resumen(prefijo) for prefijo in sys.argv[1:]]
+    markdown = tabla(filas)
+
+    print(markdown)
+
     Path("resultados").mkdir(exist_ok=True)
-    Path("resultados/resumen_costos.md").write_text(md, encoding="utf-8")
+    Path("resultados/resumen_costos.md").write_text(
+        markdown,
+        encoding="utf-8",
+    )
+
     print("\nGuardado en resultados/resumen_costos.md")
